@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: folkvang-server
+    env: python
+    region: frankfurt  # или singapore, oregon
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class eventlet -w 1 main:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_TOKEN
+        value: "folkvang2024"
+    healthCheckPath: /health
+    autoDeploy: true
