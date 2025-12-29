@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Фолькванг - Синхронизированный трекер</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        /* Все стили как в предыдущей версии, но добавляем: */
+        
+        /* Статус сервера */
+        .server-status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            z-index: 1000;
+            background: rgba(30, 41, 59, 0.9);
+            backdrop-filter: blur(10px);
+            border: 2px solid;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .server-status.connected {
+            border-color: #10b981;
+            color: #10b981;
+        }
+        
+        .server-status.connecting {
+            border-color: #f59e0b;
+            color: #f59e0b;
+        }
+        
+        .server-status.disconnected {
+            border-color: #ef4444;
+            color: #ef4444;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .connected .status-dot { background: #10b981; animation: pulse 2s infinite; }
+        .connecting .status-dot { background: #f59e0b; }
+        .disconnected .status-dot { background: #ef4444; }
+        
+        /* Уведомления от сервера */
+        .server-notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, #1e293b, #0f172a);
+            color: white;
+            padding: 15px;
+            border-radius: 12px;
+            border: 2px solid #10b981;
+            z-index: 2000;
+            max-width: 300px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            animation: slideInRight 0.3s ease;
+        }
+        
+        .server-notification.fade-out {
+            animation: fadeOutUp 0.3s ease forwards;
+        }
+        
+        .notification-title {
+            font-weight: bold;
+            margin-bottom: 8px;
+            color: #10b981;
+            font-size: 14px;
+        }
+        
+        .notification-content {
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+        
+        @keyframes fadeOutUp {
+            to {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Статус сервера -->
+        <div id="serverStatus" class="server-status disconnected">
+            <div class="status-dot"></div>
+            <span id="serverStatusText">Сервер: отключен</span>
+        </div>
+        
+        <!-- Весь остальной интерфейс как раньше -->
+        <!-- Шапка, вкладки этажей, боссы и т.д. -->
+        
+    </div>
+
+    <script>
+        // ===== WebSocket клиент для Render =====
+        class RenderServer {
+            constructor() {
+                this.socket = null;
+                this.connected = false;
+                this.reconnectAttempts = 0;
+                this.maxReconnectAttempts = 5;
+                this.reconnectDelay = 3000;
+                this.serverUrl = null;
+                this.serverDomains = [
+                    'wss://folkvang-server.onrender.com',
+                    'wss://folkvang-boss-tracker.onrender.com',
+                    'ws://localhost:10000'  // для локальной разработки
+                ];
+            }
+            
+            async init() {
+                await this.findWorkingServer();
+                this.connect();
+                this.startHeartbeat();
+            }
+            
+            async findWorkingServer() {
+                // Пробуем найти рабочий сервер
+                for (const url of this.serverDomains) {
+                    if (await this.testServer(url)) {
+                        this.serverUrl = url;
+                        this.updateStatus('connecting', `Подключение к ${new URL(url).hostname}`);
+                        console.log(`✅ Найден сервер: ${url}`);
+                        return;
+                    }
+                }
+                
+                console.log('❌ Не удалось найти рабочий сервер');
+                this.serverUrl = null;
+                this.updateStatus('disconnected', 'Сервер недоступен');
+            }
+            
+            async testServer(url) {
+                return new Promise((resolve) => {
+                    const testSocket = new WebSocket(url);
+                    
+                    testSocket.onopen = () => {
+                        testSocket.close();
+                        resolve(true);
+                    };
+                    
+                    testSocket.onerror = () => {
+                        resolve(false);
+                    };
+                    
+                    setTimeout(() => resolve(false), 2000);
+                });
+            }
+            
+            connect() {
+                if (!this.serverUrl) {
+                    console.log('Нет доступного сервера');
+                    setTimeout(() => this.findWorkingServer(), 10000);
+                    return;
+                }
+                
+                try {
+                    console.log(`🔄 Подключение к ${this.serverUrl}`);
+                    this.socket = new WebSocket(this.serverUrl);
+                    
+                    this.socket.onopen = () => {
+                        console.log('✅ Успешное подключение к серверу');
+                        this.connected = true;
+                        this.reconnectAttempts = 0;
+                        this.updateStatus('connected', 'Синхронизировано с сервером');
+                        
+                        // Запрашиваем текущее состояние
+                        setTimeout(() => {
+                            if (this.connected && this.socket) {
+                                this.socket.send(JSON.stringify({ action: 'get_state' }));
+                            }
+                        }, 1000);
+                    };
+                    
+                    this.socket.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            this.handleMessage(data);
+                        } catch (error) {
+                            console.error('Ошибка парсинга сообщения:', error);
+                        }
+                    };
+                    
+                    this.socket.onclose = (event) => {
+                        console.log(`❌ Соединение закрыто: ${event.code} ${event.reason}`);
+                        this.connected = false;
+                        this.updateStatus('disconnected', 'Потеряно соединение с сервером');
+                        this.attemptReconnect();
+                    };
+                    
+                    this.socket.onerror = (error) => {
+                        console.error('WebSocket ошибка:', error);
+                        this.updateStatus('disconnected', 'Ошибка соединения');
+                    };
+                    
+                } catch (error) {
+                    console.error('Ошибка подключения:', error);
+                    this.attemptReconnect();
+                }
+            }
+            
+            handleMessage(data) {
+                // console.log('📨 Сообщение от сервера:', data);
+                
+                if (data.action === 'boss_killed' || data.type === 'boss_update') {
+                    this.processKill(data);
+                } else if (data.initial_state || data.state_update) {
+                    this.syncWithServer(data.initial_state || data.state_update);
+                } else if (data.connected) {
+                    console.log('Сервер подтвердил подключение');
+                } else if (data.pong) {
+                    // Ответ на пинг
+                } else if (data.kill_confirmed) {
+                    if (data.success) {
+                        this.showNotification({
+                            title: '✅ Убийство синхронизировано',
+                            message: 'Все игроки получат обновление'
+                        });
+                    }
+                }
+            }
+            
+            processKill(killData) {
+                const bossNames = {
+                    'mage': 'Вёльва',
+                    'healer': 'Скальд',
+                    'spearman': 'Копейщик',
+                    'berserk': 'Берсерк'
+                };
+                
+                const floorId = `floor${killData.floor}`;
+                const bossType = killData.boss;
+                const bossName = bossNames[bossType] || bossType;
+                
+                if (bossesData[floorId] && bossesData[floorId][bossType]) {
+                    const boss = bossesData[floorId][bossType];
+                    const killTime = new Date(killData.kill_time).getTime();
+                    
+                    // Обновляем если убийство новее
+                    if (!boss.lastKill || killTime > boss.lastKill) {
+                        boss.lastKill = killTime;
+                        saveToLocalStorage();
+                        updateBossTimer(floorId, bossType, false);
+                        
+                        // Показываем уведомление (только если убийство не наше)
+                        const currentPlayer = tg.initDataUnsafe?.user?.first_name || 'Игрок';
+                        if (killData.player !== currentPlayer) {
+                            this.showKillNotification(bossName, killData.floor, killData.player);
+                        }
+                    }
+                }
+            }
+            
+            syncWithServer(serverState) {
+                console.log('🔄 Синхронизация с сервером');
+                
+                let updated = false;
+                
+                Object.keys(serverState).forEach(floorId => {
+                    Object.keys(serverState[floorId]).forEach(bossType => {
+                        const serverBoss = serverState[floorId][bossType];
+                        const localBoss = bossesData[floorId]?.[bossType];
+                        
+                        if (serverBoss && localBoss && serverBoss.kill_time) {
+                            const killTime = new Date(serverBoss.kill_time).getTime();
+                            
+                            if (!localBoss.lastKill || killTime > localBoss.lastKill) {
+                                localBoss.lastKill = killTime;
+                                updated = true;
+                            }
+                        }
+                    });
+                });
+                
+                if (updated) {
+                    saveToLocalStorage();
+                    updateAllTimers();
+                    console.log('✅ Данные синхронизированы');
+                }
+            }
+            
+            sendKill(floorId, bossType, playerName) {
+                if (!this.connected || !this.socket) {
+                    console.log('Нет соединения с сервером, сохраняем локально');
+                    return { success: false, message: 'Нет соединения' };
+                }
+                
+                const floorNum = floorId.replace('floor', '');
+                
+                const killData = {
+                    action: 'boss_kill',
+                    floor: parseInt(floorNum),
+                    boss: bossType,
+                    player: playerName,
+                    timestamp: new Date().toISOString()
+                };
+                
+                try {
+                    this.socket.send(JSON.stringify(killData));
+                    return { success: true, message: 'Отправлено на сервер' };
+                } catch (error) {
+                    console.error('Ошибка отправки:', error);
+                    return { success: false, message: 'Ошибка отправки' };
+                }
+            }
+            
+            showKillNotification(bossName, floor, player) {
+                const notification = document.createElement('div');
+                notification.className = 'server-notification';
+                notification.innerHTML = `
+                    <div class="notification-title">🎯 НОВОЕ УБИЙСТВО</div>
+                    <div class="notification-content">
+                        <div><strong>${bossName}</strong></div>
+                        <div>Этаж: ${floor}</div>
+                        <div>Игрок: ${player}</div>
+                        <div style="font-size: 11px; color: #94a3b8; margin-top: 5px;">
+                            Таймер обновлен
+                        </div>
+                    </div>
+                `;
+                
+                document.body.appendChild(notification);
+                
+                setTimeout(() => {
+                    notification.classList.add('fade-out');
+                    setTimeout(() => {
+                        if (notification.parentNode) {
+                            document.body.removeChild(notification);
+                        }
+                    }, 300);
+                }, 5000);
+            }
+            
+            showNotification(data) {
+                // Простое уведомление
+                if (tg.showPopup && typeof tg.showPopup === 'function') {
+                    tg.showPopup({
+                        title: data.title,
+                        message: data.message,
+                        buttons: [{ type: 'ok' }]
+                    });
+                } else {
+                    alert(`${data.title}\n${data.message}`);
+                }
+            }
+            
+            updateStatus(status, text) {
+                const element = document.getElementById('serverStatus');
+                const textElement = document.getElementById('serverStatusText');
+                
+                if (element && textElement) {
+                    element.className = `server-status ${status}`;
+                    textElement.textContent = text;
+                }
+            }
+            
+            attemptReconnect() {
+                if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                    this.reconnectAttempts++;
+                    const delay = this.reconnectDelay * this.reconnectAttempts;
+                    
+                    console.log(`Попытка переподключения ${this.reconnectAttempts} через ${delay}мс`);
+                    this.updateStatus('connecting', `Переподключение... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+                    
+                    setTimeout(() => {
+                        this.connect();
+                    }, delay);
+                } else {
+                    console.log('Достигнут лимит попыток переподключения');
+                    this.updateStatus('disconnected', 'Сервер недоступен. Используйте локальный режим.');
+                    
+                    // Пробуем найти другой сервер через 30 секунд
+                    setTimeout(() => {
+                        this.reconnectAttempts = 0;
+                        this.findWorkingServer();
+                    }, 30000);
+                }
+            }
+            
+            startHeartbeat() {
+                // Пинг каждые 30 секунд для поддержания соединения
+                setInterval(() => {
+                    if (this.connected && this.socket && this.socket.readyState === WebSocket.OPEN) {
+                        this.socket.send(JSON.stringify({ action: 'ping' }));
+                    }
+                }, 30000);
+            }
+        }
+        
+        // Создаем и инициализируем сервер
+        const renderServer = new RenderServer();
+        
+        // ===== ОБНОВЛЕННАЯ ФУНКЦИЯ markBossKilled =====
+        async function markBossKilled() {
+            if (!currentBoss) return;
+            
+            const { floorId, bossType } = currentBoss;
+            const boss = bossesData[floorId][bossType];
+            const playerName = tg.initDataUnsafe?.user?.first_name || 'Игрок';
+            
+            // 1. Обновляем локально
+            boss.lastKill = Date.now();
+            saveToLocalStorage();
+            
+            // 2. Отправляем на сервер Render
+            const result = renderServer.sendKill(floorId, bossType, playerName);
+            
+            // 3. Показываем уведомление
+            if (result.success) {
+                showAlert(`✅ ${boss.name} убит!\nУведомление отправлено на сервер.\nВсе игроки увидят обновление!`);
+            } else {
+                showAlert(`✅ ${boss.name} отмечен локально.\n${result.message}\nПри восстановлении связи данные синхронизируются.`);
+            }
+            
+            // 4. Обновляем интерфейс
+            updateBossTimer(floorId, bossType, true);
+            updateTimersForFloor(floorId);
+            
+            // 5. Закрываем окно
+            closeModal();
+        }
+        
+        // ===== ОБНОВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ =====
+        function initApp() {
+            // Загружаем локальные данные
+            loadFromLocalStorage();
+            
+            // Обновляем все таймеры
+            updateAllTimers();
+            updateLastUpdateTime();
+            
+            // Инициализируем подключение к серверу Render
+            renderServer.init();
+            
+            // Автообновление таймеров
+            setInterval(updateAllTimers, 1000);
+            
+            // Обновляем время в подвале
+            setInterval(updateLastUpdateTime, 30000);
+            
+            // Настройка Telegram
+            const tg = window.Telegram.WebApp || {};
+            if (tg.expand && typeof tg.expand === 'function') {
+                tg.expand();
+            }
+            
+            if (tg.platform === 'android' && tg.BackButton && typeof tg.BackButton.show === 'function') {
+                tg.BackButton.show();
+                tg.BackButton.onClick(() => {
+                    if (document.getElementById('bossModal').classList.contains('active')) {
+                        closeModal();
+                    } else if (tg.close && typeof tg.close === 'function') {
+                        tg.close();
+                    }
+                });
+            }
+        }
+        
+        // Запуск при загрузке
+        document.addEventListener('DOMContentLoaded', initApp);
+    </script>
+</body>
+</html>
